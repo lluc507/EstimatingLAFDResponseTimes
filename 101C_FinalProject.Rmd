@@ -1,0 +1,270 @@
+---
+title: "101C Kaggle Project"
+author: "Leon Luc, 304443064,  Section 2B"
+date: "May 22, 2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Data and Packages
+```{r}
+# Load Packages
+library(readr)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(corrplot)
+library(caret)
+library(gam)
+library(splines)
+library(xgboost)
+
+# Load Data
+lafdtraining <- read_csv("C:/Users/griz1/Documents/College/Junior Year/Spring 2017/STATS 101C/lafdtrainingupdated.csv")
+testing.without <- read_csv("C:/Users/griz1/Documents/College/Junior Year/Spring 2017/STATS 101C/testing.without.response")
+
+# Rename variables in training and testing data
+names(lafdtraining) <- c("row.id", "incident.ID", "year", "first_district", "EDC",
+                  "dispatch_sequence", "dispatch_status", "unit_type", 
+                  "PPE", "ICT", "elapsed_time")
+names(testing.without) <- c("row.id", "incident.ID", "year", "first_district", "EDC",
+                 "dispatch_sequence", "dispatch_status", "unit_type", "PPE", "ICT")
+
+```
+
+
+# Clean the Data
+```{r}
+# Drop row.id, incident.id, and EDC variables 
+train <- lafdtraining[, c(-1, -2, -5)]
+test <- testing.without[, c(-1, -2, -5)]
+
+# Use only complete cases of trains
+sum(is.na(train))
+train <- train[complete.cases(train), ]
+
+# Make dispatch_sequence and ICT numeric predictors
+train$dispatch_sequence <- as.numeric(train$dispatch_sequence)
+test$dispatch_sequence <- as.numeric(test$dispatch_sequence)
+train$ICT <- as.numeric(train$ICT)
+test$ICT <- as.numeric(test$ICT)
+
+# Drop Dispatch Sequence values greater than 155
+train <- train[train$dispatch_sequence < 156, ]
+
+# Drop unused factor levels in train unit_type
+d <- train
+d <- d[d$unit_type != "FC - Fire Chief", ]
+d <- d[d$unit_type != "PT - Planning Trailer", ]
+train <- d
+
+# Solve an error when predicting test response values
+# merged EL and SC with a unit type that had around the same average response value
+train$unit_type[train$unit_type == "EL - Emergency Lighting"] <- 
+  "P"
+train$unit_type[train$unit_type == "SC - Swift Water Coordinator"] <- 
+  "CP - Command Post Unit"
+test$unit_type[test$unit_type == "EL - Emergency Lighting"] <- 
+  "CP - Command Post Unit"
+test$unit_type[test$unit_type == "SC - Swift Water Coordinator"] <- 
+  "CP - Command Post Unit"
+
+# Convert train data categorical variables to factors 
+train$year <- as.factor(train$year)                         # 4 levels
+train$first_district <- as.factor(train$first_district)         # 102 levels
+train$dispatch_status <- as.factor(train$dispatch_status)   # 12 levels
+train$unit_type <- as.factor(train$unit_type)             # 38 levels
+train$PPE <- as.factor(train$PPE)                         # 2 levels
+
+# Convert test data categorical variables to factors 
+test$year <- as.factor(test$year)                         # 4 levels
+test$first_district <- as.factor(test$first_district)     # 102 levels
+test$dispatch_status <- as.factor(test$dispatch_status)   # 12 levels
+test$unit_type <- as.factor(test$unit_type)               # 38 levels
+test$PPE <- as.factor(test$PPE)                           # 2 levels   
+
+# 30% subset of train data for faster computations
+set.seed(88)
+samp <- sample(nrow(train), .3*nrow(train))
+dat <- train[samp, ]
+
+```
+
+
+# Replace test NAs
+```{r}
+# replace test unit_type RP with RA 
+test$unit_type[test$unit_type == "RP - Rehab Plug Buggy"] <- "RA - ALS Rescue Ambulance"
+
+# Replace Test NAs using regression
+set.seed(123)      # set seed for reproduceability
+samp2 <- sample(nrow(train), .5*nrow(train))   
+dat3 <- train[samp2, ]    # 50% subset of training data
+
+# Model for the dispatch sequence NAs in test data
+NA_mod <- lm(dispatch_sequence ~ year + first_district + 
+                     dispatch_status + unit_type + PPE + ICT + PPE:ICT, 
+                     data = dat3) 
+summary(NA_mod)
+
+bad <- test[which(is.na(test$dispatch_sequence)), ]  
+new_d <- predict(NA_mod, bad)   
+  # predict missing dispatch sequence values in test data
+test$dispatch_sequence[which(is.na(test$dispatch_sequence))] <- new_d
+anyNA(test)    # yields FALSE
+
+```
+
+
+# Exploratory Analysis
+```{r}
+# Exploratory Analysis
+str(train)
+summary(train$elapsed_time)
+
+# 98th to 100th percentile of response
+quantile(train$elapsed_time, seq(.98, 1, .004))
+
+# Smaller Subset
+set.seed(123)      # set seed for reproduceability
+samp2 <- sample(nrow(train), .2*nrow(train))   
+dat2 <- train[samp2, ]    # 50% subset of training data
+
+# Are the response values normally distributed? NO
+qqnorm(dat2$elapsed_time)
+qqline(dat2$elapsed_time)
+
+# levels of certain categorical variables
+levels(train$first_district)        
+levels(train$dispatch_status)   
+levels(train$unit_type)         
+
+# plot of response variable
+plot(dat2$elapsed_time)
+
+# boxplots
+boxplot(dat2$PPE, log(dat2$elapsed_time),
+        ylab = "log of elapsed time",
+        main = "Boxplot of PPE: EMS vs non-EMS")
+
+# Mean response by group levels
+train %>% group_by(year) %>% summarise(mean(elapsed_time)) 
+train %>% group_by(first_district) %>% summarise(mean(elapsed_time))
+train %>% group_by(dispatch_status) %>% summarise(mean(elapsed_time))
+train %>% group_by(unit_type) %>% summarise(mean(elapsed_time))
+train %>% group_by(PPE) %>% summarise(mean(elapsed_time))
+
+# t-test 
+t.test(dat2$elapsed_time ~ dat2$PPE, paired = FALSE, na.action = na.pass)
+
+# plot of Incident Creation Time vs Response 
+plot(dat2$ICT, dat2$elapsed_time)
+plot(dat2$ICT, dat2$elapsed_time,
+     ylim = c(0, 4000))
+
+# Correlation between numeric variables
+cormat <- round(cor(dat[,unlist(lapply(dat, is.numeric))],
+                    use="pairwise.complete.obs"),3)
+cormat
+
+```
+
+
+# XGBoost
+```{r, eval = FALSE}
+# want smaller subset of data for xgboost
+set.seed(88)
+samp <- sample(nrow(train), .3*nrow(train))
+dat <- train[samp, ]
+datTest <- train[-samp, ]
+
+dmy <- dummyVars("~.", data = datTest)
+datTestTransf <- data.frame(predict(dmy, newdata = datTest))
+
+# binarize
+dmy <- dummyVars(" ~ .", data = dat)
+datTransf <- data.frame(predict(dmy, newdata = dat))
+
+# binarize TEST
+dmy <- dummyVars(" ~ .", data = test)
+testTransf <- data.frame(predict(dmy, newdata = test))
+
+# testing tuning parameters combinations
+xgb_grid <-  expand.grid(
+  nrounds = 100,
+  max_depth = c(1,2,3),
+  eta = c(0.01, 0.015, 0.05),
+  gamma = 0,
+  colsample_bytree = c(0.3, 0.6, 0.8),
+  min_child_weight = c(1, 3, 5),
+  subsample = 1
+)
+
+# 5 fold cross-validation
+tc <- trainControl(method = 'repeatedcv', number= 5, repeats = 1, verboseIter = TRUE)
+
+# XGBoost model
+m8 <- train(elapsed_time ~.,
+            data = datTransf,
+            method = 'xgbTree',
+            trControl = tc, 
+            tuneGrid = xgb_grid)
+
+# head of XG Boost model results
+head(m8$results)
+
+# predict values for train
+predDat <- predict(m8, newdata = datTransf) 
+
+# calculate training MSE
+cat("\n The training MSE is", mean((dat$elapsed_time - predDat)^2), "\n") 
+  # training MSE: 1292198
+
+# no Hose Carrier unit type in testing data, but there is in the training data
+unit_type.HC...Hose.Carrier <- rep(0, nrow(testTransf))
+testTransf$unit_type.HC...Hose.Carrier <- unit_type.HC...Hose.Carrier
+
+# predict test response values
+predTest <- predict(m8, newdata = testTransf)
+  # Final Kaggle MSE: 1403603.15497 (public score)
+  # private score: 1429982.55420
+summary(predTest)
+summary(train$elapsed_time)   # compare with summary of training response values
+
+# make results a data frame 
+results <- data.frame(row.id = testing.without$row.id, prediction = predTest)
+head(results)
+
+# output a csv file
+write.csv(results, file = "C:/Users/andy_/Desktop/Stats 101C/Final Project/xgBoostV2_1.csv", row.names=FALSE)
+
+```
+
+
+```{r, echo = FALSE}
+# a R workspace of the XG Boost model for convenience and speed
+load("~/Desktop/101C Kaggle Project/XGBoost8.RData")
+
+# no Hose Carrier unit type in testing data, but there is in the training data
+unit_type.HC...Hose.Carrier <- rep(0, nrow(testTransf))
+testTransf$unit_type.HC...Hose.Carrier <- unit_type.HC...Hose.Carrier
+
+# head of XGBoost model results
+head(m8$results)
+
+# calculate training MSE
+cat("\n The training MSE is", mean((dat$elapsed_time - predDat)^2), "\n")
+
+# predict test response values
+predTest <- predict(m8, newdata = testTransf)
+summary(predTest)
+
+# make results a data frame 
+results <- data.frame(row.id = testing.without$row.id, prediction = predTest)
+head(results)
+```
+
